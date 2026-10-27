@@ -55,6 +55,7 @@ struct CameraUniforms {
 struct RenderSettings {
     gaussian_scaling: f32,
     sh_deg: f32,
+    frustum_culling: f32,
 }
 
 struct Gaussian {
@@ -160,8 +161,9 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     let ndc = pos_clip.xy / pos_clip.w;
 
     // 3. view frustum culling (1.2x screen box keeps edge gaussians)
-    if (pos_view.z < 0.2) { return; }
-    if (abs(ndc.x) > 1.2 || abs(ndc.y) > 1.2) { return; }
+    let culling = render_settings.frustum_culling > 0.5;
+    if (pos_view.z < 0.2) { return; }   // behind / too close: always rejected (projection is invalid)
+    if (culling && (abs(ndc.x) > 1.2 || abs(ndc.y) > 1.2)) { return; }
 
     // 4. 3D covariance  Sigma = R S S^T R^T   (same as 3DGS computeCov3D)
     let r01 = unpack2x16float(g.rot[0]);
@@ -224,7 +226,7 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     let radius_ndc = 2.0 * radius_px / camera.viewport;
 
     // quad completely off screen -> cull
-    if (abs(ndc.x) - radius_ndc.x > 1.0 || abs(ndc.y) - radius_ndc.y > 1.0) { return; }
+    if (culling && (abs(ndc.x) - radius_ndc.x > 1.0 || abs(ndc.y) - radius_ndc.y > 1.0)) { return; }
 
     let opacity = 1.0 / (1.0 + exp(-b.y));   // sigmoid
 
