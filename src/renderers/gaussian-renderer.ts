@@ -3,9 +3,12 @@ import preprocessWGSL from '../shaders/preprocess.wgsl';
 import renderWGSL from '../shaders/gaussian.wgsl';
 import { get_sorter,c_histogram_block_rows,C } from '../sort/sort';
 import { Renderer } from './renderer';
+import { GpuTimer } from '../utils/gpu-timer';
 
 export interface GaussianRenderer extends Renderer {
   set_gaussian_multiplier: (value: number) => void,
+  set_frustum_culling: (on: boolean) => void,
+  set_workgroup_size: (size: number) => void,
 }
 
 // Utility to create GPU buffers
@@ -21,6 +24,13 @@ const createBuffer = (
   return buffer;
 };
 
+// 1D dispatch is limited to 65535 workgroups -> spill into y for small workgroup sizes
+export const dispatch_size = (n_threads: number, wg_size: number): [number, number] => {
+  const groups = Math.ceil(n_threads / wg_size);
+  const x = Math.min(groups, 65535);
+  return [x, Math.ceil(groups / x)];
+};
+
 export default function get_renderer(
   pc: PointCloud,
   device: GPUDevice,
@@ -29,6 +39,7 @@ export default function get_renderer(
 ): GaussianRenderer {
 
   const sorter = get_sorter(pc.num_points, device);
+  const timer = new GpuTimer(device);
 
   // ===============================================
   //            Initialize GPU Buffers
@@ -48,8 +59,8 @@ export default function get_renderer(
     new Uint32Array([4, 0, 0, 0])
   );
 
-  // struct RenderSettings { gaussian_scaling: f32, sh_deg: f32 } (+ padding to 16 bytes)
-  const render_settings_data = new Float32Array([1.0, pc.sh_deg, 0, 0]);
+  // struct RenderSettings { gaussian_scaling, sh_deg, frustum_culling } (+ padding to 16 bytes)
+  const render_settings_data = new Float32Array([1.0, pc.sh_deg, 1.0, 0]);
   const render_settings_buffer = createBuffer(
     device, 'render settings', 4 * 4,
     GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -59,51 +70,66 @@ export default function get_renderer(
   // ===============================================
   //    Create Compute Pipeline and Bind Groups
   // ===============================================
-  const preprocess_pipeline = device.createComputePipeline({
-    label: 'preprocess',
-    layout: 'auto',
-    compute: {
-      module: device.createShaderModule({ code: preprocessWGSL }),
-      entryPoint: 'preprocess',
-      constants: {
-        workgroupSize: C.histogram_wg_size,
-        sortKeyPerThread: c_histogram_block_rows,
+  const preprocess_module = device.createShaderModule({ code: preprocessWGSL });
+
+  // the pipeline (and its 'auto' bind group layouts) depend on the workgroup
+  // size, so everything is rebuilt when the UI changes it
+  let workgroup_size = C.histogram_wg_size;
+  let preprocess_pipeline: GPUComputePipeline;
+  let preprocess_bind_groups: GPUBindGroup[];
+
+  const build_preprocess = (wg_size: number) => {
+    workgroup_size = wg_size;
+    preprocess_pipeline = device.createComputePipeline({
+      label: 'preprocess',
+      layout: 'auto',
+      compute: {
+        module: preprocess_module,
+        entryPoint: 'preprocess',
+        constants: {
+          workgroupSize: wg_size,
+          sortKeyPerThread: c_histogram_block_rows,
+          sortWorkgroupSize: C.histogram_wg_size,
+        },
       },
-    },
-  });
+    });
 
-  const sort_bind_group = device.createBindGroup({
-    label: 'sort',
-    layout: preprocess_pipeline.getBindGroupLayout(2),
-    entries: [
-      { binding: 0, resource: { buffer: sorter.sort_info_buffer } },
-      { binding: 1, resource: { buffer: sorter.ping_pong[0].sort_depths_buffer } },
-      { binding: 2, resource: { buffer: sorter.ping_pong[0].sort_indices_buffer } },
-      { binding: 3, resource: { buffer: sorter.sort_dispatch_indirect_buffer } },
-    ],
-  });
+    const camera_bind_group = device.createBindGroup({
+      label: 'preprocess camera',
+      layout: preprocess_pipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: camera_buffer } }],
+    });
 
-  const camera_bind_group = device.createBindGroup({
-    label: 'preprocess camera',
-    layout: preprocess_pipeline.getBindGroupLayout(0),
-    entries: [{ binding: 0, resource: { buffer: camera_buffer } }],
-  });
+    const gaussian_bind_group = device.createBindGroup({
+      label: 'preprocess gaussians',
+      layout: preprocess_pipeline.getBindGroupLayout(1),
+      entries: [
+        { binding: 0, resource: { buffer: pc.gaussian_3d_buffer } },
+        { binding: 1, resource: { buffer: splat_buffer } },
+        { binding: 2, resource: { buffer: pc.sh_buffer } },
+      ],
+    });
 
-  const gaussian_bind_group = device.createBindGroup({
-    label: 'preprocess gaussians',
-    layout: preprocess_pipeline.getBindGroupLayout(1),
-    entries: [
-      { binding: 0, resource: { buffer: pc.gaussian_3d_buffer } },
-      { binding: 1, resource: { buffer: splat_buffer } },
-      { binding: 2, resource: { buffer: pc.sh_buffer } },
-    ],
-  });
+    const sort_bind_group = device.createBindGroup({
+      label: 'sort',
+      layout: preprocess_pipeline.getBindGroupLayout(2),
+      entries: [
+        { binding: 0, resource: { buffer: sorter.sort_info_buffer } },
+        { binding: 1, resource: { buffer: sorter.ping_pong[0].sort_depths_buffer } },
+        { binding: 2, resource: { buffer: sorter.ping_pong[0].sort_indices_buffer } },
+        { binding: 3, resource: { buffer: sorter.sort_dispatch_indirect_buffer } },
+      ],
+    });
 
-  const settings_bind_group = device.createBindGroup({
-    label: 'preprocess render settings',
-    layout: preprocess_pipeline.getBindGroupLayout(3),
-    entries: [{ binding: 0, resource: { buffer: render_settings_buffer } }],
-  });
+    const settings_bind_group = device.createBindGroup({
+      label: 'preprocess render settings',
+      layout: preprocess_pipeline.getBindGroupLayout(3),
+      entries: [{ binding: 0, resource: { buffer: render_settings_buffer } }],
+    });
+
+    preprocess_bind_groups = [camera_bind_group, gaussian_bind_group, sort_bind_group, settings_bind_group];
+  };
+  build_preprocess(C.histogram_wg_size);
 
 
   // ===============================================
@@ -146,17 +172,17 @@ export default function get_renderer(
   //    Command Encoder Functions
   // ===============================================
   const preprocess = (encoder: GPUCommandEncoder) => {
-    const pass = encoder.beginComputePass({ label: 'preprocess' });
+    // timestamps 0/1 = preprocess begin/end
+    const pass = encoder.beginComputePass({ label: 'preprocess', timestampWrites: timer.writes(0, 1) });
     pass.setPipeline(preprocess_pipeline);
-    pass.setBindGroup(0, camera_bind_group);
-    pass.setBindGroup(1, gaussian_bind_group);
-    pass.setBindGroup(2, sort_bind_group);
-    pass.setBindGroup(3, settings_bind_group);
-    pass.dispatchWorkgroups(Math.ceil(pc.num_points / C.histogram_wg_size));
+    preprocess_bind_groups.forEach((g, i) => pass.setBindGroup(i, g));
+    const [x, y] = dispatch_size(pc.num_points, workgroup_size);
+    pass.dispatchWorkgroups(x, y);
     pass.end();
   };
 
   const render = (encoder: GPUCommandEncoder, texture_view: GPUTextureView) => {
+    // timestamps 2/3 = render begin/end (sort time = t2 - t1)
     const pass = encoder.beginRenderPass({
       label: 'gaussian render',
       colorAttachments: [{
@@ -165,6 +191,7 @@ export default function get_renderer(
         clearValue: [0, 0, 0, 1],
         storeOp: 'store',
       }],
+      timestampWrites: timer.writes(2, 3),
     });
     pass.setPipeline(render_pipeline);
     pass.setBindGroup(0, render_bind_group);
@@ -187,11 +214,18 @@ export default function get_renderer(
       // keys_size (offset 0 of sort_info) -> instanceCount (offset 4 of indirect args)
       encoder.copyBufferToBuffer(sorter.sort_info_buffer, 0, indirect_draw_buffer, 4, 4);
       render(encoder, texture_view);
+      timer.resolve(encoder, sorter.sort_info_buffer);   // count = visible splats
     },
     camera_buffer,
+    timer,
     set_gaussian_multiplier: (value: number) => {
       render_settings_data[0] = value;
       device.queue.writeBuffer(render_settings_buffer, 0, render_settings_data);
     },
+    set_frustum_culling: (on: boolean) => {
+      render_settings_data[2] = on ? 1.0 : 0.0;
+      device.queue.writeBuffer(render_settings_buffer, 0, render_settings_data);
+    },
+    set_workgroup_size: (size: number) => build_preprocess(size),
   };
 }

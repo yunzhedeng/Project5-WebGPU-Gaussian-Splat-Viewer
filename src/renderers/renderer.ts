@@ -3,13 +3,16 @@ import { Pane } from 'tweakpane';
 import * as TweakpaneFileImportPlugin from 'tweakpane-plugin-file-import';
 import { default as get_renderer_gaussian, GaussianRenderer } from './gaussian-renderer';
 import { default as get_renderer_pointcloud } from './point-cloud-renderer';
+import { default as get_renderer_gaussian_tile } from './gaussian-tile-renderer';
 import { Camera, load_camera_presets} from '../camera/camera';
 import { CameraControl } from '../camera/camera-control';
 import { time, timeReturn } from '../utils/simple-console';
+import { GpuTimer } from '../utils/gpu-timer';
 
 export interface Renderer {
   frame: (encoder: GPUCommandEncoder, texture_view: GPUTextureView) => void,
   camera_buffer: GPUBuffer,
+  timer?: GpuTimer,   // GPU timestamps + visible splat count (performance analysis)
 }
 
 export default async function init(
@@ -19,8 +22,9 @@ export default async function init(
 ) {
   let ply_file_loaded = false; 
   let cam_file_loaded = false; 
-  let renderers: { pointcloud?: Renderer, gaussian?: Renderer } = {};
+  let renderers: { pointcloud?: Renderer, gaussian?: Renderer, gaussian_tile?: Renderer } = {};
   let gaussian_renderer: GaussianRenderer | undefined; 
+  let gaussian_tile_renderer: GaussianRenderer | undefined; 
   let pointcloud_renderer: Renderer | undefined; 
   let renderer: Renderer | undefined; 
   let cameras;
@@ -51,7 +55,17 @@ export default async function init(
     renderer: 'pointcloud',
     ply_file: '',
     cam_file: '',
+    // performance analysis
+    gpu_preprocess_ms: 0.0,
+    gpu_sort_ms: 0.0,
+    gpu_render_ms: 0.0,
+    gpu_total_ms: 0.0,
+    visible_splats: 0,
+    frustum_culling: true,
+    workgroup_size: 256,
   };
+  const gaussian_renderers = () =>
+    [gaussian_renderer, gaussian_tile_renderer].filter(r => r !== undefined) as GaussianRenderer[];
 
   const pane = new Pane({
     title: 'Config',
@@ -64,10 +78,29 @@ export default async function init(
     });
   }
   {
+    // GPU timing needs the 'timestamp-query' feature (see main.ts)
+    const perf = pane.addFolder({ title: device.features.has('timestamp-query')
+      ? 'GPU time (ms)' : 'GPU time (timestamp-query unavailable)' });
+    perf.addMonitor(params, 'gpu_preprocess_ms', { label: 'preprocess', format: (v: number) => v.toFixed(3) });
+    perf.addMonitor(params, 'gpu_sort_ms', { label: 'sort', format: (v: number) => v.toFixed(3) });
+    perf.addMonitor(params, 'gpu_render_ms', { label: 'render', format: (v: number) => v.toFixed(3) });
+    perf.addMonitor(params, 'gpu_total_ms', { label: 'total', format: (v: number) => v.toFixed(3) });
+    perf.addMonitor(params, 'visible_splats', { label: 'visible', format: (v: number) => v.toFixed(0) });
+    perf.addInput(params, 'frustum_culling').on('change', (e) => {
+      gaussian_renderers().forEach(r => r.set_frustum_culling(e.value));
+    });
+    perf.addInput(params, 'workgroup_size', {
+      options: { '16': 16, '32': 32, '64': 64, '128': 128, '256': 256 },
+    }).on('change', (e) => {
+      gaussian_renderers().forEach(r => r.set_workgroup_size(e.value));
+    });
+  }
+  {
     pane.addInput(params, 'renderer', {
       options: {
         pointcloud: 'pointcloud',
         gaussian: 'gaussian',
+        gaussian_tile: 'gaussian_tile',
       }
     }).on('change', (e) => {
       renderer = renderers[e.value];
@@ -87,9 +120,16 @@ export default async function init(
         pointcloud_renderer = get_renderer_pointcloud(pc, device, presentation_format, camera.uniform_buffer);
         gaussian_renderer = get_renderer_gaussian(pc, device, presentation_format, camera.uniform_buffer);
         gaussian_renderer.set_gaussian_multiplier(params.gaussian_multiplier);
+        gaussian_tile_renderer = get_renderer_gaussian_tile(pc, device, presentation_format, camera.uniform_buffer, canvas);
+        gaussian_tile_renderer.set_gaussian_multiplier(params.gaussian_multiplier);
+        gaussian_renderers().forEach(r => {
+          r.set_frustum_culling(params.frustum_culling);
+          r.set_workgroup_size(params.workgroup_size);
+        });
         renderers = {
           pointcloud: pointcloud_renderer,
           gaussian: gaussian_renderer,
+          gaussian_tile: gaussian_tile_renderer,
         };
         renderer = renderers[params.renderer];
         ply_file_loaded = true;
@@ -124,6 +164,7 @@ export default async function init(
     ).on('change', (e) => {
       //TODO: Bind constants to the gaussian renderer.
       gaussian_renderer?.set_gaussian_multiplier(e.value);
+      gaussian_tile_renderer?.set_gaussian_multiplier(e.value);
     });
   }
 
@@ -140,6 +181,7 @@ export default async function init(
       case '8':
       case '9':
         const i = parseInt(event.key);
+        if (!cameras || i >= cameras.length) break;
         console.log(`set to camera preset ${i}`);
         camera.set_preset(cameras[i]);
         break;
@@ -154,6 +196,15 @@ export default async function init(
       const texture_view = context.getCurrentTexture().createView();
       renderer.frame(encoder, texture_view);
       device.queue.submit([encoder.finish()]);
+      if (renderer.timer) {
+        renderer.timer.after_submit();
+        const s = renderer.timer.stats;
+        params.gpu_preprocess_ms = s.preprocess_ms;
+        params.gpu_sort_ms = s.sort_ms;
+        params.gpu_render_ms = s.render_ms;
+        params.gpu_total_ms = s.total_ms;
+        params.visible_splats = s.count;
+      }
     }
     requestAnimationFrame(frame);
   }

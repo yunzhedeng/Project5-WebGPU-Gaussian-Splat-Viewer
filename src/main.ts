@@ -18,11 +18,17 @@ import { assert } from './utils/util';
     return;
   }
   
+  const requiredFeatures: GPUFeatureName[] = [];
+  if (adapter.features.has('timestamp-query')) requiredFeatures.push('timestamp-query');
+
+
   const device = await adapter.requestDevice({
+    requiredFeatures,
     requiredLimits: { 
       maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
-      maxStorageBufferBindingSize: adapter.limits. maxStorageBufferBindingSize
-     },
+      maxStorageBufferBindingSize: adapter.limits. maxStorageBufferBindingSize,
+      maxBufferSize: adapter.limits.maxBufferSize,
+    },
   });
 
   const canvas = document.querySelector<HTMLCanvasElement>('#webgpu-canvas');
