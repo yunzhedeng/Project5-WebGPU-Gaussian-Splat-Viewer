@@ -9,11 +9,11 @@
 
 ![](img/gaussian_bicycle.png)
 
-[![](img/thumb.png)](http://TODO.github.io/Project4-WebGPU-Forward-Plus-and-Clustered-Deferred)
+[![](img/thumb.png)](https://yunzhedeng.github.io/Project5-WebGPU-Gaussian-Splat-Viewer/)
 
 ### Demo Video/GIF
 
-[![](img/video.mp4)](TODO)
+[![](img/final.gif)]
 
 ### Overview
 
