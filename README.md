@@ -7,13 +7,11 @@
 
 ### Live Demo
 
-![](img/gaussian_bicycle.png)
-
-[![](img/thumb.png)](https://yunzhedeng.github.io/Project5-WebGPU-Gaussian-Splat-Viewer/)
+[![](img/gaussian_bicycle.png)](https://yunzhedeng.github.io/Project5-WebGPU-Gaussian-Splat-Viewer/)
 
 ### Demo Video/GIF
 
-[![](img/final.gif)]
+![](img/final.gif)
 
 ### Overview
 
